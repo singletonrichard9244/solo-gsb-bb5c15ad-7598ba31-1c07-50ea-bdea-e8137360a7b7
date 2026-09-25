@@ -1494,3 +1494,310 @@ def test_performance_audit_is_read_only():
     )
     assert response.status_code == 200
     assert client.get(f"/measures/{measure_id}").json() == before
+
+
+# --- POST /measures/{id}/entry-cues-preview ---------------------------------
+
+# lead entries: v1e2 at 1/4, v1e4 at 3/4 (each follows a rest).
+# bass onsets at 0, 1/4, 5/8; pad onset at 5/8 (merges with bass's).
+ENTRY_CUES_PAYLOAD = {
+    "target_duration": "1",
+    "voices": [
+        {
+            "name": "lead",
+            "events": [
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+            ],
+        },
+        {
+            "name": "bass",
+            "events": [
+                {"kind": "sound", "duration": "1/8"},
+                {"kind": "rest", "duration": "1/8"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/8"},
+                {"kind": "sound", "duration": "1/8"},
+                {"kind": "rest", "duration": "1/4"},
+            ],
+        },
+        {
+            "name": "pad",
+            "events": [
+                {"kind": "rest", "duration": "5/8"},
+                {"kind": "sound", "duration": "1/8"},
+                {"kind": "rest", "duration": "1/4"},
+            ],
+        },
+    ],
+}
+
+
+def test_entry_cues_preview_merges_same_time_sources_and_covers_entries():
+    measure_id = client.post("/measures", json=ENTRY_CUES_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["voice"] == "lead"
+    assert body["lookback"] == "1/4"
+    assert body["entries"] == [
+        {"event_id": "v1e2", "start": "1/4"},
+        {"event_id": "v1e4", "start": "3/4"},
+    ]
+    # v1e2's window [0, 1/4) holds only the cue at 0; v1e4's window
+    # [1/2, 3/4) holds only 5/8, where bass and pad merge into one cue.
+    assert body["cue_count"] == 2
+    assert body["cues"] == [
+        {"time": "0", "sources": ["v2e1"], "covers": ["v1e2"]},
+        {"time": "5/8", "sources": ["v2e5", "v3e2"], "covers": ["v1e4"]},
+    ]
+
+
+def test_entry_cues_preview_ties_break_to_earliest_time_sequence():
+    # lead entries at 1/2 and 3/4; hits candidates at 1/4, 3/8, 1/2.
+    # The minimum cover is two cues: {1/4 or 3/8} for the first entry
+    # plus {1/2} for the second; (1/4, 1/2) is lexicographically
+    # earliest.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "lead",
+                "events": [
+                    {"kind": "rest", "duration": "1/2"},
+                    {"kind": "sound", "duration": "1/8"},
+                    {"kind": "rest", "duration": "1/8"},
+                    {"kind": "sound", "duration": "1/4"},
+                ],
+            },
+            {
+                "name": "hits",
+                "events": [
+                    {"kind": "rest", "duration": "1/4"},
+                    {"kind": "sound", "duration": "1/8"},
+                    {"kind": "sound", "duration": "1/8"},
+                    {"kind": "sound", "duration": "1/2"},
+                ],
+            },
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cue_count"] == 2
+    assert [cue["time"] for cue in body["cues"]] == ["1/4", "1/2"]
+    assert body["cues"][0]["covers"] == ["v1e2"]
+    assert body["cues"][1]["covers"] == ["v1e4"]
+
+
+def test_entry_cues_preview_single_cue_can_cover_two_entries():
+    # lead entries at 1/2 and 5/8; the only hit, at 3/8, lies in both
+    # windows [1/4, 1/2) and [3/8, 5/8), so one cue covers everything.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "lead",
+                "events": [
+                    {"kind": "rest", "duration": "1/2"},
+                    {"kind": "sound", "duration": "1/16"},
+                    {"kind": "rest", "duration": "1/16"},
+                    {"kind": "sound", "duration": "3/8"},
+                ],
+            },
+            {
+                "name": "hits",
+                "events": [
+                    {"kind": "rest", "duration": "3/8"},
+                    {"kind": "sound", "duration": "1/8"},
+                    {"kind": "rest", "duration": "1/2"},
+                ],
+            },
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["cue_count"] == 1
+    assert body["cues"] == [
+        {"time": "3/8", "sources": ["v2e2"], "covers": ["v1e2", "v1e4"]}
+    ]
+
+
+def test_entry_cues_preview_window_is_half_open():
+    # Entry at 1/2 with lookback 1/4: the candidate exactly at 1/4
+    # (e - lookback) counts, the one exactly at 1/2 (e itself) does not.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "lead",
+                "events": [
+                    {"kind": "rest", "duration": "1/2"},
+                    {"kind": "sound", "duration": "1/2"},
+                ],
+            },
+            {
+                "name": "hits",
+                "events": [
+                    {"kind": "rest", "duration": "1/4"},
+                    {"kind": "sound", "duration": "1/4"},
+                    {"kind": "sound", "duration": "1/2"},
+                ],
+            },
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["cues"] == [
+        {"time": "1/4", "sources": ["v2e2"], "covers": ["v1e2"]}
+    ]
+
+
+def test_entry_cues_preview_uncoverable_entry_returns_422():
+    # melody's only entry is v1e3 at 3/4; the sole candidate (bass's
+    # onset at 1/4) lies outside the [1/2, 3/4) window for lookback 1/4.
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "melody", "lookback": "1/4"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["voice"] == "melody"
+    assert detail["lookback"] == "1/4"
+    assert detail["uncovered"] == ["v1e3"]
+    assert "saved" in detail["message"]
+
+    # Widening the lookback to 1/2 brings 1/4 into the window.
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "melody", "lookback": "1/2"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["cues"] == [
+        {"time": "1/4", "sources": ["v2e2"], "covers": ["v1e3"]}
+    ]
+
+
+def test_entry_cues_preview_ignores_target_voice_onsets_as_candidates():
+    # lead's own onset at 1/4 must not cue its entry at 1/2; with no
+    # other voice sounding inside [1/4, 1/2) the request is rejected.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "lead",
+                "events": [
+                    {"kind": "sound", "duration": "1/4"},
+                    {"kind": "rest", "duration": "1/4"},
+                    {"kind": "sound", "duration": "1/2"},
+                ],
+            },
+            {"name": "pad", "events": [{"kind": "rest", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["uncovered"] == ["v1e3"]
+
+
+def test_entry_cues_preview_without_entries_returns_empty_plan():
+    # lead never sounds right after a rest: no entries, no cues needed.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {
+                "name": "lead",
+                "events": [
+                    {"kind": "sound", "duration": "1/2"},
+                    {"kind": "rest", "duration": "1/2"},
+                ],
+            },
+            {"name": "hits", "events": [{"kind": "sound", "duration": "1"}]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["entries"] == []
+    assert body["cue_count"] == 0
+    assert body["cues"] == []
+
+
+def test_entry_cues_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 404
+    assert response.json() == {"detail": "measure not found"}
+
+
+def test_entry_cues_preview_422_for_unknown_voice():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "drums", "lookback": "1/4"},
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["voice"] == "drums"
+    assert "not found" in detail["message"]
+
+
+def test_entry_cues_preview_validates_lookback_and_required_fields():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    # lookback must be a positive rational string.
+    for bad in ("0", "-1/4", "abc", "1.5", "1/0"):
+        response = client.post(
+            f"/measures/{measure_id}/entry-cues-preview",
+            json={"voice": "melody", "lookback": bad},
+        )
+        assert response.status_code == 422, bad
+    # Missing body / fields are request-validation errors too.
+    assert client.post(
+        f"/measures/{measure_id}/entry-cues-preview", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "melody"},
+    ).status_code == 422
+
+
+def test_entry_cues_preview_is_read_only():
+    measure_id = client.post("/measures", json=ENTRY_CUES_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    response = client.post(
+        f"/measures/{measure_id}/entry-cues-preview",
+        json={"voice": "lead", "lookback": "1/4"},
+    )
+    assert response.status_code == 200
+    assert client.get(f"/measures/{measure_id}").json() == before

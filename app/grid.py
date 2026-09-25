@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import deque
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
@@ -1618,3 +1618,144 @@ def performance_audit(
         "extra": extra,
         "total_abs_diff": values[0][0][1],
     }
+
+
+# --- Entry cues: planning the fewest cues for rest-following onsets ---------
+
+class EntryCuesInfeasible(Exception):
+    """Some rest-following onset has no candidate cue inside its window."""
+
+    def __init__(self, uncovered: list[str]) -> None:
+        super().__init__(
+            "no candidate cue within lookback for entries: "
+            + ", ".join(uncovered)
+        )
+        # Event ids of the entries no candidate cue can ever cover, in
+        # the target voice's event order.
+        self.uncovered = uncovered
+
+
+def entry_cues_preview(
+    voices: list[dict], target_name: str, lookback: Fraction
+) -> dict:
+    """Plan the fewest other-voice cues for one voice's entries.
+
+    ``voices`` items are {"name": str, "events": [built events]} in the
+    measure's stored order and ``target_name`` must be one of them.
+    Every sound event of the target voice that immediately follows a
+    rest event is an *entry* whose start must be cued (the first event
+    of the voice never follows anything, so it is never an entry). A
+    candidate cue is the start of any sound event of any *other* voice;
+    several source events starting at the same instant merge into a
+    single candidate. A cue at time t covers an entry starting at e
+    exactly when t lies in the half-open window [e - ``lookback``, e):
+    a cue exactly lookback before the entry counts, one exactly at the
+    entry does not.
+
+    The result is a minimum-size set of cue times covering every entry;
+    among minimum-size sets the sorted time sequence is the
+    lexicographically earliest one (the earliest feasible cue time is
+    fixed first, then the earliest feasible next one, and so on).
+    Raises EntryCuesInfeasible listing the event ids of every entry
+    whose window holds no candidate at all.
+
+    Returns {"entries": [built events], "cues": [{"time", "sources",
+    "covers"}]} with Fraction times; "sources" are the merged source
+    event ids in stored voice order and "covers" the ids of every entry
+    the cue's window reaches (an entry may be covered by several cues).
+
+    Optimization: entry windows are intervals whose left and right ends
+    increase together, so the classic earliest-deadline greedy — always
+    taking the latest candidate before the first uncovered entry — is
+    optimal. A suffix DP (needed[i] = cues required for entries i..)
+    evaluates that greedy from every position and yields the minimum
+    count k. The lexicographically earliest k-cue sequence is then
+    rebuilt left to right: at each step the smallest candidate inside
+    the first uncovered entry's window that still leaves an optimal
+    (k-1)-cue completion (checked against needed) is taken.
+    """
+    target = next(voice for voice in voices if voice["name"] == target_name)
+
+    # Entries: sound events of the target voice right after a rest.
+    events = target["events"]
+    entries = [
+        events[index]
+        for index in range(1, len(events))
+        if events[index]["kind"] == KIND_SOUND
+        and events[index - 1]["kind"] == KIND_REST
+    ]
+    if not entries:
+        return {"entries": [], "cues": []}
+
+    # Candidate cue times from every other voice's sound onsets; several
+    # events starting at the same instant merge into one candidate.
+    sources_by_time: dict[Fraction, list[str]] = {}
+    for voice in voices:
+        if voice["name"] == target_name:
+            continue
+        for event in voice["events"]:
+            if event["kind"] == KIND_SOUND:
+                sources_by_time.setdefault(event["start"], []).append(event["id"])
+    times = sorted(sources_by_time)
+
+    starts = [entry["start"] for entry in entries]
+
+    # Every entry window must hold at least one candidate: the latest
+    # candidate before the entry start must not fall before the window.
+    uncovered = []
+    for entry in entries:
+        slot = bisect_left(times, entry["start"])
+        if slot == 0 or times[slot - 1] < entry["start"] - lookback:
+            uncovered.append(entry["id"])
+    if uncovered:
+        raise EntryCuesInfeasible(uncovered)
+
+    count = len(entries)
+
+    # Suffix DP: needed[i] = minimum cues covering entries i..count-1.
+    # The greedy choice for entry i is the latest candidate before its
+    # start (within the suffix it covers a superset of what any earlier
+    # candidate covers), after which the first entry beyond
+    # cue_time + lookback remains uncovered.
+    needed = [0] * (count + 1)
+    for index in range(count - 1, -1, -1):
+        cue_time = times[bisect_left(times, starts[index]) - 1]
+        following = bisect_right(starts, cue_time + lookback)
+        needed[index] = 1 + needed[following]
+
+    # Lexicographically earliest minimum sequence: at each step take the
+    # smallest candidate inside the first uncovered entry's window that
+    # still leaves an optimal (remaining - 1)-cue cover of the rest.
+    selected: list[Fraction] = []
+    index = 0
+    remaining = needed[0]
+    while remaining > 0:
+        slot = bisect_left(times, starts[index] - lookback)
+        chosen: Fraction | None = None
+        while slot < len(times) and times[slot] < starts[index]:
+            cue_time = times[slot]
+            following = bisect_right(starts, cue_time + lookback)
+            if needed[following] == remaining - 1:
+                chosen = cue_time
+                break
+            slot += 1
+        assert chosen is not None  # the greedy latest candidate always is
+        selected.append(chosen)
+        index = bisect_right(starts, chosen + lookback)
+        remaining -= 1
+
+    cues = []
+    for cue_time in selected:
+        # Entries covered by this cue: starts in (cue_time, cue_time +
+        # lookback], i.e. cue_time in [start - lookback, start).
+        first = bisect_right(starts, cue_time)
+        last = bisect_right(starts, cue_time + lookback)
+        cues.append(
+            {
+                "time": cue_time,
+                "sources": sources_by_time[cue_time],
+                "covers": [entries[i]["id"] for i in range(first, last)],
+            }
+        )
+
+    return {"entries": entries, "cues": cues}

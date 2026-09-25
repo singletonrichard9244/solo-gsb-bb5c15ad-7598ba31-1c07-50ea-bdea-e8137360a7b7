@@ -443,3 +443,53 @@ class PerformanceAuditOut(BaseModel):
     extra: list[int]
     # Sum of |diff| over all pairs (the minimized secondary objective).
     total_abs_diff: str
+
+
+class EntryCuesPreviewIn(BaseModel):
+    """Target voice name plus the positive rational lookback window.
+
+    ``voice`` is the voice whose rest-following sound onsets need cues;
+    ``lookback`` is a positive rational string: a cue at time t covers
+    an entry starting at e exactly when t lies in [e - lookback, e).
+    """
+
+    voice: str = Field(min_length=1, max_length=100, examples=["lead"])
+    lookback: str = Field(examples=["1/4"])
+
+    @field_validator("lookback")
+    @classmethod
+    def lookback_must_be_positive_rational(cls, value: str) -> str:
+        try:
+            parse_rational(value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
+
+class EntryCuesEntryOut(BaseModel):
+    """One entry to be cued: a sound event right after a rest."""
+
+    event_id: str
+    start: str
+
+
+class EntryCueOut(BaseModel):
+    """One chosen cue: its time, merged source events, covered entries."""
+
+    time: str
+    # Source sound events starting at this time, in stored voice order.
+    sources: list[str]
+    # Entry event ids whose window contains this cue time.
+    covers: list[str]
+
+
+class EntryCuesPreviewOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voice: str
+    lookback: str
+    # Every rest-following sound onset of the target voice, by start.
+    entries: list[EntryCuesEntryOut]
+    # Minimum number of cue times covering all entries.
+    cue_count: int
+    cues: list[EntryCueOut]

@@ -7,6 +7,7 @@ from fractions import Fraction
 from app.grid import (
     KIND_REST,
     KIND_SOUND,
+    EntryCuesInfeasible,
     LoopAlignmentTooLarge,
     PerformanceAuditOffsetsInvalid,
     PracticeTracksInfeasible,
@@ -19,6 +20,7 @@ from app.grid import (
     build_voice_events,
     compute_grid,
     compute_time_preview,
+    entry_cues_preview,
     find_rhythm_match,
     find_sound_conflicts,
     format_rational,
@@ -1618,6 +1620,211 @@ class PerformanceAuditTest(unittest.TestCase):
         self.assertEqual([e["id"] for e in result["missed"]], ["v1e1"])
         self.assertEqual(result["extra"], [])
         self.assertEqual(result["total_abs_diff"], Fraction(0))
+
+
+class EntryCuesPreviewTest(unittest.TestCase):
+    def test_entries_are_sound_onsets_immediately_after_rests(self):
+        # lead: sound, rest, sound, sound, rest, sound. Only v1e3 and
+        # v1e6 follow a rest; v1e1 is the first event and v1e4 follows a
+        # sound, so neither is an entry. With lookback 1 the single pad
+        # onset at 0 reaches both entries.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/4"), (KIND_SOUND, "1/8"),
+                        (KIND_REST, "1/16"), (KIND_SOUND, "1/16"),
+                    ],
+                ),
+                ("pad", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1))
+        self.assertEqual(
+            [(entry["id"], entry["start"]) for entry in result["entries"]],
+            [("v1e3", Fraction(1, 2)), ("v1e6", Fraction(15, 16))],
+        )
+        self.assertEqual(
+            [
+                (cue["time"], cue["sources"], cue["covers"])
+                for cue in result["cues"]
+            ],
+            [(Fraction(0), ["v2e1"], ["v1e3", "v1e6"])],
+        )
+
+    def test_merges_same_time_sources_into_one_cue(self):
+        # bass and pad both sound at 5/8: one cue with two sources,
+        # listed in stored voice order.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                    ],
+                ),
+                (
+                    "bass",
+                    [
+                        (KIND_SOUND, "1/8"), (KIND_REST, "1/8"),
+                        (KIND_SOUND, "1/4"), (KIND_REST, "1/8"),
+                        (KIND_SOUND, "1/8"), (KIND_REST, "1/4"),
+                    ],
+                ),
+                (
+                    "pad",
+                    [
+                        (KIND_REST, "5/8"), (KIND_SOUND, "1/8"),
+                        (KIND_REST, "1/4"),
+                    ],
+                ),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(
+            [
+                (cue["time"], cue["sources"], cue["covers"])
+                for cue in result["cues"]
+            ],
+            [
+                (Fraction(0), ["v2e1"], ["v1e2"]),
+                (Fraction(5, 8), ["v2e5", "v3e2"], ["v1e4"]),
+            ],
+        )
+
+    def test_minimum_count_then_lexicographically_earliest_times(self):
+        # Entries at 1/2 and 3/4; candidates 1/4, 3/8, 1/2. Two cues are
+        # necessary; {3/8, 1/2} also covers everything, but (1/4, 1/2)
+        # is the lexicographically earliest time sequence.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_REST, "1/2"), (KIND_SOUND, "1/8"),
+                        (KIND_REST, "1/8"), (KIND_SOUND, "1/4"),
+                    ],
+                ),
+                (
+                    "hits",
+                    [
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/8"),
+                        (KIND_SOUND, "1/8"), (KIND_SOUND, "1/2"),
+                    ],
+                ),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(
+            [cue["time"] for cue in result["cues"]],
+            [Fraction(1, 4), Fraction(1, 2)],
+        )
+        self.assertEqual(result["cues"][0]["covers"], ["v1e2"])
+        self.assertEqual(result["cues"][1]["covers"], ["v1e4"])
+
+    def test_earliest_cue_must_still_allow_an_optimal_completion(self):
+        # Entries at 1/2 and 5/8; candidates 1/4 and 3/8. The single cue
+        # at 3/8 covers both, so the optimum is one cue — the earlier
+        # candidate 1/4 (covering only the first entry) is part of no
+        # one-cue solution and must be skipped.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_REST, "1/2"), (KIND_SOUND, "1/16"),
+                        (KIND_REST, "1/16"), (KIND_SOUND, "3/8"),
+                    ],
+                ),
+                (
+                    "hits",
+                    [
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/8"),
+                        (KIND_SOUND, "5/8"),
+                    ],
+                ),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(
+            [(cue["time"], cue["covers"]) for cue in result["cues"]],
+            [(Fraction(3, 8), ["v1e2", "v1e4"])],
+        )
+
+    def test_window_is_half_open(self):
+        # Entry at 1/2, lookback 1/4: the candidate at 1/4 (exactly
+        # e - lookback) counts, the one at 1/2 (exactly e) does not.
+        voices = make_voices(
+            [
+                ("lead", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+                (
+                    "hits",
+                    [
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                        (KIND_SOUND, "1/2"),
+                    ],
+                ),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(
+            [(cue["time"], cue["sources"]) for cue in result["cues"]],
+            [(Fraction(1, 4), ["v2e2"])],
+        )
+
+    def test_target_voice_onsets_are_not_candidates(self):
+        # lead's own onset at 1/4 cannot cue its entry at 1/2, and no
+        # other voice sounds: the entry is uncoverable.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/2"),
+                    ],
+                ),
+                ("pad", [(KIND_REST, "1")]),
+            ]
+        )
+        with self.assertRaises(EntryCuesInfeasible) as ctx:
+            entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(ctx.exception.uncovered, ["v1e3"])
+
+    def test_uncoverable_entries_are_all_listed_in_order(self):
+        # Two entries, neither reachable within lookback 1/8 (no other
+        # voice sounds at all): both ids are reported in event order.
+        voices = make_voices(
+            [
+                (
+                    "lead",
+                    [
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                        (KIND_REST, "1/4"), (KIND_SOUND, "1/4"),
+                    ],
+                ),
+                ("pad", [(KIND_REST, "1")]),
+            ]
+        )
+        with self.assertRaises(EntryCuesInfeasible) as ctx:
+            entry_cues_preview(voices, "lead", Fraction(1, 8))
+        self.assertEqual(ctx.exception.uncovered, ["v1e2", "v1e4"])
+
+    def test_no_entries_needs_no_cues(self):
+        # lead never sounds right after a rest: the plan is empty even
+        # though candidates exist.
+        voices = make_voices(
+            [
+                ("lead", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("hits", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = entry_cues_preview(voices, "lead", Fraction(1, 4))
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(result["cues"], [])
 
 
 if __name__ == "__main__":
