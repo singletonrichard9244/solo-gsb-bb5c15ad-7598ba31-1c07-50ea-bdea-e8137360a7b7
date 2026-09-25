@@ -84,6 +84,16 @@ missed plus extra hits, then the sum of absolute paired differences,
 and ties are broken by the lexicographically smallest paired hit-index
 sequence. It is a read-only diagnostic; nothing is written back to
 SQLite.
+
+A saved measure can finally be previewed for entry cues
+(POST /measures/{id}/entry-cues-preview): every sound event of the
+target voice that immediately follows a rest is an entry to be cued,
+and a cue is another voice's sound onset inside the half-open lookback
+window [entry - lookback, entry). Source events sharing one time merge
+into a single cue. The preview picks the fewest cue times covering
+every entry, ties broken by the lexicographically earliest time
+sequence; entries without any candidate cue are rejected with 422. It
+is a read-only preview; nothing is written back to SQLite.
 """
 
 from __future__ import annotations
@@ -97,6 +107,7 @@ from . import db
 from .grid import (
     MAX_EXPANDED_EVENTS,
     MAX_PRACTICE_TRACK_VOICES,
+    EntryCuesUncovered,
     LoopAlignmentTooLarge,
     PerformanceAuditOffsetsInvalid,
     PracticeTracksInfeasible,
@@ -109,6 +120,7 @@ from .grid import (
     build_voice_events,
     compute_grid,
     compute_time_preview,
+    entry_cues_preview,
     find_rhythm_match,
     format_rational,
     format_seconds,
@@ -125,6 +137,8 @@ from .grid import (
 from .schemas import (
     AvoidancePreviewIn,
     AvoidancePreviewOut,
+    EntryCuesPreviewIn,
+    EntryCuesPreviewOut,
     GridOut,
     LeadHandoffPreviewOut,
     LoopAlignmentIn,
@@ -178,6 +192,7 @@ def root() -> dict:
             "practice_tracks": "POST /measures/{id}/practice-tracks",
             "rehearsal_chunks_preview": "POST /measures/{id}/rehearsal-chunks-preview",
             "performance_audit": "POST /measures/{id}/performance-audit",
+            "entry_cues_preview": "POST /measures/{id}/entry-cues-preview",
         },
     }
 
@@ -763,4 +778,63 @@ def performance_audit_route(measure_id: int, payload: PerformanceAuditIn) -> dic
         "missed": [event["id"] for event in result["missed"]],
         "extra": result["extra"],
         "total_abs_diff": format_rational(result["total_abs_diff"]),
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/entry-cues-preview",
+    response_model=EntryCuesPreviewOut,
+)
+def entry_cues_preview_route(measure_id: int, payload: EntryCuesPreviewIn) -> dict:
+    # Read-only: the cue plan is computed from the stored measure in
+    # exact fractions, but SQLite is never written back to.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    _, voices = _fraction_voices(measure)
+    target = next((v for v in voices if v["name"] == payload.voice), None)
+    if target is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice not found in measure",
+                "voice": payload.voice,
+            },
+        )
+
+    lookback = parse_rational(payload.lookback)
+    others = [voice for voice in voices if voice["name"] != payload.voice]
+    try:
+        result = entry_cues_preview(target["events"], others, lookback)
+    except EntryCuesUncovered as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "some entries have no candidate cue within "
+                "lookback; nothing was saved",
+                "voice": payload.voice,
+                "lookback": format_rational(lookback),
+                "uncovered": [event["id"] for event in exc.uncovered],
+            },
+        ) from exc
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voice": payload.voice,
+        "lookback": format_rational(lookback),
+        "cue_count": len(result["cues"]),
+        "entries": [
+            {"event_id": event["id"], "start": format_rational(event["start"])}
+            for event in result["entries"]
+        ],
+        "cues": [
+            {
+                "time": format_rational(cue["time"]),
+                "sources": [event["id"] for event in cue["sources"]],
+                "covers": [event["id"] for event in cue["covers"]],
+            }
+            for cue in result["cues"]
+        ],
     }

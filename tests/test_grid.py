@@ -7,6 +7,7 @@ from fractions import Fraction
 from app.grid import (
     KIND_REST,
     KIND_SOUND,
+    EntryCuesUncovered,
     LoopAlignmentTooLarge,
     PerformanceAuditOffsetsInvalid,
     PracticeTracksInfeasible,
@@ -19,6 +20,7 @@ from app.grid import (
     build_voice_events,
     compute_grid,
     compute_time_preview,
+    entry_cues_preview,
     find_rhythm_match,
     find_sound_conflicts,
     format_rational,
@@ -1618,6 +1620,198 @@ class PerformanceAuditTest(unittest.TestCase):
         self.assertEqual([e["id"] for e in result["missed"]], ["v1e1"])
         self.assertEqual(result["extra"], [])
         self.assertEqual(result["total_abs_diff"], Fraction(0))
+
+
+class EntryCuesPreviewTest(unittest.TestCase):
+    def voices(self, specs):
+        return make_voices(specs)
+
+    def plan(self, voices, lookback, target_index=0):
+        target = voices[target_index]
+        others = [voice for voice in voices if voice is not target]
+        return entry_cues_preview(target["events"], others, Fraction(*lookback))
+
+    def test_only_sound_events_right_after_a_rest_are_entries(self):
+        # v1e1 is the first event (nothing precedes it), v1e2 follows a
+        # sound, v1e4 follows a rest: only v1e4 is an entry.
+        voices = self.voices(
+            [
+                (
+                    "solo",
+                    [
+                        (KIND_SOUND, "1/4"),
+                        (KIND_SOUND, "1/4"),
+                        (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/4"),
+                    ],
+                ),
+                ("pad", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = self.plan(voices, (1, 2))
+        self.assertEqual([e["id"] for e in result["entries"]], ["v1e4"])
+        self.assertEqual(result["entries"][0]["start"], Fraction(3, 4))
+        # The pad onset at 1/4 lies in the window [1/4, 3/4): one cue.
+        self.assertEqual([cue["time"] for cue in result["cues"]], [Fraction(1, 4)])
+
+    def test_window_is_half_open_at_both_ends(self):
+        # Entry at 1/2 with lookback 1/4: the window is [1/4, 1/2). A
+        # source exactly at 1/4 counts; one exactly at the onset does not.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+                ("pad", [(KIND_REST, "1/4"), (KIND_SOUND, "3/4")]),
+            ]
+        )
+        result = self.plan(voices, (1, 4))
+        self.assertEqual([cue["time"] for cue in result["cues"]], [Fraction(1, 4)])
+        self.assertEqual(
+            [[e["id"] for e in cue["covers"]] for cue in result["cues"]],
+            [["v1e2"]],
+        )
+
+        # A source starting exactly at the entry onset is too late.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+                ("pad", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        with self.assertRaises(EntryCuesUncovered) as ctx:
+            self.plan(voices, (1, 4))
+        self.assertEqual([e["id"] for e in ctx.exception.uncovered], ["v1e2"])
+
+    def test_sources_at_the_same_time_merge_into_one_cue(self):
+        # a and b both start a sound at 0: one cue with two sources in
+        # stored voice order.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+                ("a", [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")]),
+                ("b", [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")]),
+            ]
+        )
+        result = self.plan(voices, (1, 2))
+        self.assertEqual(len(result["cues"]), 1)
+        cue = result["cues"][0]
+        self.assertEqual(cue["time"], Fraction(0))
+        self.assertEqual([e["id"] for e in cue["sources"]], ["v2e1", "v3e1"])
+        self.assertEqual([e["id"] for e in cue["covers"]], ["v1e2"])
+
+    def test_one_cue_can_cover_several_entries(self):
+        # Entries at 1/4 and 1/2; the single source onset 1/8 lies in
+        # both windows [−1/4, 1/4) and [0, 1/2), so one cue covers both.
+        voices = self.voices(
+            [
+                (
+                    "solo",
+                    [
+                        (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/8"),
+                        (KIND_REST, "1/8"),
+                        (KIND_SOUND, "1/2"),
+                    ],
+                ),
+                ("pad", [(KIND_REST, "1/8"), (KIND_SOUND, "7/8")]),
+            ]
+        )
+        result = self.plan(voices, (1, 2))
+        self.assertEqual(len(result["cues"]), 1)
+        cue = result["cues"][0]
+        self.assertEqual(cue["time"], Fraction(1, 8))
+        self.assertEqual([e["id"] for e in cue["covers"]], ["v1e2", "v1e4"])
+
+    def test_fewest_cues_then_lexicographically_earliest_times(self):
+        # Entries at 1/4 and 3/4, lookback 1/2; sources at 0, 1/8, 1/2.
+        # Two cues are necessary. Both {0, 1/2} and {1/8, 1/2} cover
+        # everything; the lexicographically earliest time sequence wins,
+        # so the first cue is 0, not the later 1/8 a per-window greedy
+        # for the latest usable time would pick.
+        voices = self.voices(
+            [
+                (
+                    "solo",
+                    [
+                        (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/4"),
+                        (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/4"),
+                    ],
+                ),
+                (
+                    "pad",
+                    [
+                        (KIND_SOUND, "1/8"),
+                        (KIND_SOUND, "1/8"),
+                        (KIND_REST, "1/4"),
+                        (KIND_SOUND, "1/2"),
+                    ],
+                ),
+            ]
+        )
+        result = self.plan(voices, (1, 2))
+        self.assertEqual(
+            [cue["time"] for cue in result["cues"]],
+            [Fraction(0), Fraction(1, 2)],
+        )
+        self.assertEqual(
+            [[e["id"] for e in cue["covers"]] for cue in result["cues"]],
+            [["v1e2"], ["v1e4"]],
+        )
+
+    def test_uncovered_entries_are_reported_in_order(self):
+        # The only source onset is 0; with lookback 1/8 the entry at 1/2
+        # (window [3/8, 1/2)) has no candidate.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+                ("pad", [(KIND_SOUND, "1")]),
+            ]
+        )
+        with self.assertRaises(EntryCuesUncovered) as ctx:
+            self.plan(voices, (1, 8))
+        self.assertEqual([e["id"] for e in ctx.exception.uncovered], ["v1e2"])
+
+    def test_no_entries_needs_no_cues(self):
+        # Sound-first voice: no sound event follows a rest.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("pad", [(KIND_SOUND, "1")]),
+            ]
+        )
+        result = self.plan(voices, (1, 4))
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(result["cues"], [])
+
+        # Rest-only target voice likewise has no entries even though no
+        # candidate exists at all.
+        voices = self.voices(
+            [
+                ("solo", [(KIND_REST, "1")]),
+                ("pad", [(KIND_REST, "1")]),
+            ]
+        )
+        result = self.plan(voices, (1, 4))
+        self.assertEqual(result["entries"], [])
+        self.assertEqual(result["cues"], [])
+
+    def test_target_voice_onsets_are_not_candidates(self):
+        # The target voice itself sounds at 0, but only other voices
+        # count as sources: with no other-voice onset in the window the
+        # entry is uncovered.
+        voices = self.voices(
+            [
+                (
+                    "solo",
+                    [(KIND_SOUND, "1/4"), (KIND_REST, "1/4"), (KIND_SOUND, "1/2")],
+                ),
+                ("pad", [(KIND_REST, "1")]),
+            ]
+        )
+        with self.assertRaises(EntryCuesUncovered) as ctx:
+            self.plan(voices, (1, 2))
+        self.assertEqual([e["id"] for e in ctx.exception.uncovered], ["v1e3"])
 
 
 if __name__ == "__main__":

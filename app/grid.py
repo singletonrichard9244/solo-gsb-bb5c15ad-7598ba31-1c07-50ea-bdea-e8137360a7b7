@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import deque
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from fractions import Fraction
@@ -1618,3 +1618,117 @@ def performance_audit(
         "extra": extra,
         "total_abs_diff": values[0][0][1],
     }
+
+
+# --- Entry cues: cueing one voice's post-rest onsets from the other voices ---
+
+class EntryCuesUncovered(Exception):
+    """Some post-rest onsets have no candidate cue inside their lookback."""
+
+    def __init__(self, uncovered: list[dict]) -> None:
+        super().__init__(
+            "entries without a candidate cue: "
+            + ", ".join(event["id"] for event in uncovered)
+        )
+        # Built entry events (sound onsets right after a rest) whose
+        # lookback window holds no other-voice sound onset.
+        self.uncovered = uncovered
+
+
+def entry_cues_preview(
+    target_events: list[dict], other_voices: list[dict], lookback: Fraction
+) -> dict:
+    """Plan entry cues for one voice's post-rest sound onsets.
+
+    ``target_events`` are the target voice's built events (exact Fraction
+    starts). Every sound event immediately following a rest is an entry
+    to be cued; its onset must be announced by a cue inside the half-open
+    window [start - lookback, start): a cue exactly ``lookback`` early
+    counts, one exactly at the onset does not. Candidate cues are the
+    sound-event onsets of ``other_voices`` (in stored voice order);
+    several source events sharing one onset merge into a single cue at
+    that time.
+
+    The chosen cues cover every entry with the fewest distinct cue
+    times; ties are broken by the lexicographically earliest time
+    sequence (the first differing cue time is smaller). Raises
+    EntryCuesUncovered listing every entry whose window holds no
+    candidate. Returns {"entries": [events], "cues": [{"time",
+    "sources", "covers"}]} with Fraction times and built events.
+
+    Optimization: entry onsets are strictly increasing and a cue at time
+    t covers exactly the entries with t < onset <= t + lookback — a
+    contiguous range ending at upto(t). need[i] = minimum cues covering
+    entries i.. is therefore 1 + min need[upto(t)] over the candidate
+    times t in entry i's window, computed backwards (in any minimum
+    cover of a suffix the earliest cue covers its first entry, so the
+    recurrence is exact). Forward reconstruction then always takes the
+    earliest time that can still complete an optimum, which yields the
+    lexicographically earliest optimal time sequence.
+    """
+    entries = [
+        event
+        for previous, event in zip(target_events, target_events[1:])
+        if event["kind"] == KIND_SOUND and previous["kind"] == KIND_REST
+    ]
+    starts = [event["start"] for event in entries]
+
+    # Candidate cue times: the other voices' sound onsets; events sharing
+    # a time merge into one cue. Iterating voices in stored order keeps
+    # each merged source list in stored voice order.
+    sources_at: dict[Fraction, list[dict]] = {}
+    for voice in other_voices:
+        for event in voice["events"]:
+            if event["kind"] == KIND_SOUND:
+                sources_at.setdefault(event["start"], []).append(event)
+    times = sorted(sources_at)
+
+    # A cue at time t covers entry i exactly when t lies in the half-open
+    # window [start_i - lookback, start_i); collect the windows as index
+    # ranges into ``times`` and reject every entry with an empty one.
+    windows: list[tuple[int, int]] = []
+    uncovered = []
+    for index, start in enumerate(starts):
+        lower = bisect_left(times, start - lookback)
+        upper = bisect_left(times, start)
+        windows.append((lower, upper))
+        if lower == upper:
+            uncovered.append(entries[index])
+    if uncovered:
+        raise EntryCuesUncovered(uncovered)
+
+    count = len(entries)
+    # upto[j] = first entry index (0-based) a cue at times[j] does NOT
+    # cover: the covered entries are those with onset <= time + lookback,
+    # a contiguous range because the onsets increase.
+    upto = [bisect_right(starts, time + lookback) for time in times]
+
+    # need[i] = minimum number of cues covering entries i..count-1.
+    need = [0] * (count + 1)
+    for index in range(count - 1, -1, -1):
+        lower, upper = windows[index]
+        need[index] = 1 + min(need[upto[j]] for j in range(lower, upper))
+
+    # Forward reconstruction: the earliest candidate time that can still
+    # complete an optimum gives the lexicographically earliest sequence.
+    cues = []
+    index = 0
+    while index < count:
+        lower, upper = windows[index]
+        for j in range(lower, upper):
+            if need[upto[j]] == need[index] - 1:
+                break
+        else:  # pragma: no cover - the DP guarantees an optimal completion
+            raise AssertionError("no optimal entry-cue continuation")
+        time = times[j]
+        first = bisect_right(starts, time)  # entries with onset > time
+        cues.append(
+            {
+                "time": time,
+                "sources": sources_at[time],
+                "covers": entries[first:upto[j]],
+            }
+        )
+        index = upto[j]
+
+    return {"entries": entries, "cues": cues}
